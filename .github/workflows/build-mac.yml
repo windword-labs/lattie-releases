@@ -1,8 +1,9 @@
-name: Build Lattie Mac Beta
+name: Build Lattie Mac
 
 # 拉取私有仓库 windword-labs/lattie，构建 mac arm64（Developer ID 签名 + 公证），
-# 以 prerelease 形式发布到本仓库：v<base>-beta.N
-run-name: Lattie Mac beta ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+# channel=beta（默认）：版本 <base>-beta.N，发布为 prerelease
+# channel=stable：版本取源码 apps/desktop/package.json 的 version（不加后缀），发布为 latest；tag 已存在则失败
+run-name: Lattie Mac ${{ github.event.client_payload.channel || inputs.channel || 'beta' }} ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
 
 on:
   workflow_dispatch:
@@ -12,18 +13,24 @@ on:
         required: false
         default: main
         type: string
+      channel:
+        description: 发布通道
+        required: false
+        default: beta
+        type: choice
+        options: [beta, stable]
       beta:
-        description: beta 序号；留空则自动取下一个
+        description: beta 序号（仅 beta 通道）；留空则自动取下一个
         required: false
         type: string
   repository_dispatch:
-    types: [build-mac-beta]
+    types: [build-mac, build-mac-beta]
 
 permissions:
   contents: write
 
 concurrency:
-  group: lattie-mac-beta
+  group: lattie-mac
   cancel-in-progress: false
 
 jobs:
@@ -32,6 +39,7 @@ jobs:
     timeout-minutes: 60
     env:
       SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+      CHANNEL: ${{ github.event.client_payload.channel || inputs.channel || 'beta' }}
       BETA_INPUT: ${{ github.event.client_payload.beta || inputs.beta }}
       GH_TOKEN: ${{ github.token }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -66,7 +74,13 @@ jobs:
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
-          BASE="$(node -p "require('./apps/desktop/package.json').version" | sed -E 's/-.*$//')"
+          PKG_VERSION="$(node -p "require('./apps/desktop/package.json').version")"
+          BASE="$(echo "$PKG_VERSION" | sed -E 's/-.*$//')"
+          case "$CHANNEL" in beta|stable) ;; *) echo "channel must be beta or stable" >&2; exit 1 ;; esac
+          if [ "$CHANNEL" = stable ]; then
+            [[ "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "stable 需要 package.json 版本无后缀，当前: ${PKG_VERSION}" >&2; exit 1; }
+            VERSION="$PKG_VERSION"
+          else
           if [ -n "${BETA_INPUT:-}" ]; then
             [[ "$BETA_INPUT" =~ ^[1-9][0-9]*$ ]] || { echo "beta must be a positive integer" >&2; exit 1; }
             N="$BETA_INPUT"
@@ -76,14 +90,17 @@ jobs:
             N=$(( ${LAST:-0} + 1 ))
           fi
           VERSION="${BASE}-beta.${N}"
+          fi
           if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release v${VERSION} already exists" >&2; exit 1
+            echo "release v${VERSION} already exists" >&2
+            [ "$CHANNEL" = stable ] && echo "请先在源码仓库把 apps/desktop/package.json 的 version 提升到新版本再发 stable" >&2
+            exit 1
           fi
           {
             echo "sha=$SHA"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
-          echo "Building Lattie ${VERSION} from ${SHA}"
+          echo "Building Lattie ${VERSION} (${CHANNEL}) from ${SHA}"
 
       - name: Import signing certificate
         run: |
@@ -138,8 +155,12 @@ jobs:
           set -euo pipefail
           pnpm run typecheck
           pnpm exec electron-vite build
+          # beta 构建写入 publish.channel=beta：生成 beta-mac.yml，且 app-update.yml 带 channel: beta
+          # stable 不设 channel：生成 latest-mac.yml
+          EXTRA=()
+          if [ "$CHANNEL" = beta ]; then EXTRA+=(-c.publish.channel=beta); fi
           pnpm exec electron-builder --mac --arm64 --publish never \
-            -c.extraMetadata.version="${VERSION}"
+            -c.extraMetadata.version="${VERSION}" ${EXTRA[@]+"${EXTRA[@]}"}
 
       - name: Collect artifacts
         id: pkg
@@ -149,7 +170,15 @@ jobs:
           set -euo pipefail
           mkdir -p out
           D="source/apps/desktop/dist"
-          cp "$D/Lattie-${VERSION}-arm64.dmg" "$D/Lattie-${VERSION}-arm64.zip" out/
+          cp "$D/Lattie-${VERSION}-arm64.dmg" "$D/Lattie-${VERSION}-arm64.zip" \
+             "$D/Lattie-${VERSION}-arm64.zip.blockmap" "$D/Lattie-${VERSION}-arm64.dmg.blockmap" out/
+          if [ "$CHANNEL" = beta ]; then YML=beta-mac.yml; else YML=latest-mac.yml; fi
+          cp "$D/$YML" out/
+          # electron-updater 按 yml 里的 url 下载附件：必须与实际上传的文件名完全一致
+          for f in $(sed -nE 's/^ *(- )?(url|path): (.+)$/\3/p' "out/$YML" | sort -u); do
+            test -f "out/$f" || { echo "yml 引用的 $f 不在附件中" >&2; exit 1; }
+          done
+          grep -q "^version: ${VERSION}$" "out/$YML"
           (cd out && shasum -a 256 *.dmg *.zip > SHA256SUMS && cat SHA256SUMS)
 
       - name: Verify signature and notarization
@@ -163,18 +192,19 @@ jobs:
           codesign --verify --deep --strict --verbose=2 chk/Lattie.app
           spctl -a -t exec -vv chk/Lattie.app
 
-      - name: Publish prerelease
+      - name: Publish release
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           SHA: ${{ steps.ver.outputs.sha }}
         run: |
           set -euo pipefail
-          NOTES="Lattie ${VERSION}（测试预发布版）
+          if [ "$CHANNEL" = stable ]; then KIND="正式版"; FLAGS=(--latest); else KIND="测试预发布版"; FLAGS=(--prerelease --latest=false); fi
+          NOTES="Lattie ${VERSION}（${KIND}）
           - macOS Apple 芯片（arm64），Developer ID 签名并公证
           - 源码：windword-labs/lattie@${SHA} (${SOURCE_REF})"
           gh release create "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
-            --prerelease --latest=false --title "Lattie ${VERSION}" --notes "$NOTES" \
-            out/*.dmg out/*.zip out/SHA256SUMS
+            "${FLAGS[@]}" --title "Lattie ${VERSION}" --notes "$NOTES" \
+            out/*.dmg out/*.zip out/*.blockmap out/*-mac.yml out/SHA256SUMS
 
       - name: Cleanup keychain
         if: always()
