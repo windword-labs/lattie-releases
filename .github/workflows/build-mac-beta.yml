@@ -108,6 +108,14 @@ jobs:
           # 不导出 CSC_LINK：让 electron-builder 直接从这个 keychain 找 Developer ID 身份
           echo "CSC_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
           security find-identity -v -p codesigning "${KEYCHAIN_NAME}" | sed -E 's/[0-9A-F]{40}/<hash>/'
+          # p12 可能含多个签名身份（Apple Development 等）；只接受 Developer ID Application，并显式指定给 electron-builder
+          IDENTITY="$(security find-identity -v -p codesigning "${KEYCHAIN_NAME}" | sed -nE 's/.*"(Developer ID Application: [^"]+)".*/\1/p' | head -1)"
+          if [ -z "${IDENTITY}" ]; then
+            echo "::error::p12 中没有 Developer ID Application 身份，无法公证分发"
+            exit 1
+          fi
+          # electron-builder 的 CSC_NAME 不带 "Developer ID Application: " 前缀
+          echo "CSC_NAME=${IDENTITY#Developer ID Application: }" >> "${GITHUB_ENV}"
 
       - uses: pnpm/action-setup@v4
         with:
