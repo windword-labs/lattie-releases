@@ -1,0 +1,173 @@
+name: Build Lattie Mac Beta
+
+# 拉取私有仓库 windword-labs/lattie，构建 mac arm64（Developer ID 签名 + 公证），
+# 以 prerelease 形式发布到本仓库：v<base>-beta.N
+run-name: Lattie Mac beta ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: lattie 源码分支 / tag / SHA
+        required: false
+        default: main
+        type: string
+      beta:
+        description: beta 序号；留空则自动取下一个
+        required: false
+        type: string
+  repository_dispatch:
+    types: [build-mac-beta]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lattie-mac-beta
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+      BETA_INPUT: ${{ github.event.client_payload.beta || inputs.beta }}
+      GH_TOKEN: ${{ github.token }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      CSC_LINK_BASE64: ${{ secrets.CSC_LINK_BASE64 }}
+    steps:
+      - name: Check secrets
+        env:
+          PAT: ${{ secrets.PRIVATE_REPO_PAT }}
+        run: |
+          missing=0
+          for v in PAT CSC_LINK_BASE64 CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v:-}" ]; then echo "missing secret: $v" >&2; missing=1; fi
+          done
+          exit $missing
+
+      - name: Checkout lattie
+        uses: actions/checkout@v4
+        with:
+          repository: windword-labs/lattie
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+
+      - name: Resolve version
+        id: ver
+        working-directory: source
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          BASE="$(node -p "require('./apps/desktop/package.json').version" | sed -E 's/-.*$//')"
+          if [ -n "${BETA_INPUT:-}" ]; then
+            [[ "$BETA_INPUT" =~ ^[1-9][0-9]*$ ]] || { echo "beta must be a positive integer" >&2; exit 1; }
+            N="$BETA_INPUT"
+          else
+            LAST="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+              | sed -nE "s/^v${BASE//./\\.}-beta\.([0-9]+)$/\1/p" | sort -n | tail -1)"
+            N=$(( ${LAST:-0} + 1 ))
+          fi
+          VERSION="${BASE}-beta.${N}"
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v${VERSION} already exists" >&2; exit 1
+          fi
+          {
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building Lattie ${VERSION} from ${SHA}"
+
+      - name: Import signing certificate
+        run: |
+          set -euo pipefail
+          CERT_PATH="${RUNNER_TEMP}/lattie-developer-id.p12"
+          KEYCHAIN_NAME="lattie-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "::add-mask::${KEYCHAIN_PASSWORD}"
+          echo "${CSC_LINK_BASE64}" | base64 --decode > "${CERT_PATH}"
+          security delete-keychain "${KEYCHAIN_NAME}" 2>/dev/null || true
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_NAME}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_NAME}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_NAME}"
+          security import "${CERT_PATH}" -k "${KEYCHAIN_NAME}" -P "${CSC_KEY_PASSWORD}" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          existing="$(security list-keychains -d user | sed 's/"//g')"
+          security list-keychains -d user -s "${KEYCHAIN_NAME}" ${existing}
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_NAME}"
+          rm -f "${CERT_PATH}"
+          KEYCHAIN_PATH="${HOME}/Library/Keychains/${KEYCHAIN_NAME}"
+          test -f "${KEYCHAIN_PATH}"
+          # 不导出 CSC_LINK：让 electron-builder 直接从这个 keychain 找 Developer ID 身份
+          echo "CSC_KEYCHAIN=${KEYCHAIN_PATH}" >> "${GITHUB_ENV}"
+          security find-identity -v -p codesigning "${KEYCHAIN_NAME}" | sed -E 's/[0-9A-F]{40}/<hash>/'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: source/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign and notarize
+        working-directory: source/apps/desktop
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          set -euo pipefail
+          pnpm run typecheck
+          pnpm exec electron-vite build
+          pnpm exec electron-builder --mac --arm64 --publish never \
+            -c.extraMetadata.version="${VERSION}"
+
+      - name: Collect artifacts
+        id: pkg
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          D="source/apps/desktop/dist"
+          cp "$D/Lattie-${VERSION}-arm64.dmg" "$D/Lattie-${VERSION}-arm64.zip" out/
+          (cd out && shasum -a 256 *.dmg *.zip > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Verify signature and notarization
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          xcrun stapler validate "out/Lattie-${VERSION}-arm64.dmg"
+          spctl -a -t open --context context:primary-signature -vv "out/Lattie-${VERSION}-arm64.dmg"
+          mkdir -p chk && ditto -x -k "out/Lattie-${VERSION}-arm64.zip" chk
+          codesign --verify --deep --strict --verbose=2 chk/Lattie.app
+          spctl -a -t exec -vv chk/Lattie.app
+
+      - name: Publish prerelease
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          set -euo pipefail
+          NOTES="Lattie ${VERSION}（测试预发布版）
+          - macOS Apple 芯片（arm64），Developer ID 签名并公证
+          - 源码：windword-labs/lattie@${SHA} (${SOURCE_REF})"
+          gh release create "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --prerelease --latest=false --title "Lattie ${VERSION}" --notes "$NOTES" \
+            out/*.dmg out/*.zip out/SHA256SUMS
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain lattie-signing.keychain-db 2>/dev/null || true
