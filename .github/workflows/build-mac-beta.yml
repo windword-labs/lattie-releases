@@ -157,9 +157,9 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          xcrun stapler validate "out/Lattie-${VERSION}-arm64.dmg"
-          spctl -a -t open --context context:primary-signature -vv "out/Lattie-${VERSION}-arm64.dmg"
+          # electron-builder 只公证并 staple .app（dmg/zip 内的 app 已带票据）；dmg 本身不单独公证
           mkdir -p chk && ditto -x -k "out/Lattie-${VERSION}-arm64.zip" chk
+          xcrun stapler validate chk/Lattie.app
           codesign --verify --deep --strict --verbose=2 chk/Lattie.app
           spctl -a -t exec -vv chk/Lattie.app
 
