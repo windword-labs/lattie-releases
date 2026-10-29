@@ -179,6 +179,25 @@ jobs:
         working-directory: source
         run: pnpm install --frozen-lockfile
 
+      # ffmpeg / ffprobe（LGPL，源码编译约 6 分钟）：按脚本内容缓存产物，命中时脚本发现版本戳一致直接跳过
+      - name: Cache ffmpeg
+        if: hashFiles('source/apps/desktop/scripts/build-ffmpeg.sh') != ''
+        uses: actions/cache@v4
+        with:
+          path: |
+            source/apps/desktop/core-bin/ffmpeg
+            source/apps/desktop/core-bin/ffprobe
+            source/apps/desktop/core-bin/ffmpeg.version
+          key: ffmpeg-macos-arm64-${{ hashFiles('source/apps/desktop/scripts/build-ffmpeg.sh') }}
+
+      - name: Build ffmpeg
+        if: hashFiles('source/apps/desktop/scripts/build-ffmpeg.sh') != ''
+        working-directory: source/apps/desktop
+        run: |
+          set -euo pipefail
+          bash scripts/build-ffmpeg.sh
+          ./core-bin/ffmpeg -hide_banner -encoders | grep -q h264_videotoolbox
+
       - name: Build, sign and notarize
         working-directory: source/apps/desktop
         env:
