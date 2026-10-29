@@ -2,8 +2,9 @@ name: Build Lattie Mac
 
 # 拉取私有仓库 windword-labs/lattie，构建 mac arm64（Developer ID 签名 + 公证），
 # channel=beta（默认）：独立应用「Lattie Beta」（electron-builder.beta.yml），版本 <base>-beta.N，发布为 prerelease
-# channel=stable：正式版「Lattie」（electron-builder.yml），版本取源码 apps/desktop/package.json 的 version（不加后缀），
-#                发布为 latest；tag 已存在则失败
+#   beta 的 base = 本仓库最新正式版 tag vX.Y.Z 的下一个 patch；没有正式版 tag 时取源码 apps/desktop/package.json 的 version
+# channel=stable：正式版「Lattie」（electron-builder.yml），版本取输入 version（X.Y.Z），tag vX.Y.Z，发布为 latest；tag 已存在则失败
+# 版本由 tag / 输入决定，不改 package.json；构建时注入 -c.extraMetadata.version 与 lattie-core 的 LATTIE_VERSION
 run-name: Lattie Mac ${{ github.event.client_payload.channel || inputs.channel || 'beta' }} ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
 
 on:
@@ -20,6 +21,10 @@ on:
         default: beta
         type: choice
         options: [beta, stable]
+      version:
+        description: 正式版版本号 X.Y.Z（channel=stable 时必填）
+        required: false
+        type: string
       beta:
         description: beta 序号（仅 beta 通道）；留空则自动取下一个
         required: false
@@ -42,6 +47,7 @@ jobs:
       SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
       CHANNEL: ${{ github.event.client_payload.channel || inputs.channel || 'beta' }}
       BETA_INPUT: ${{ github.event.client_payload.beta || inputs.beta }}
+      VERSION_INPUT: ${{ github.event.client_payload.version || inputs.version }}
       GH_TOKEN: ${{ github.token }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -75,13 +81,21 @@ jobs:
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
-          PKG_VERSION="$(node -p "require('./apps/desktop/package.json').version")"
-          BASE="$(echo "$PKG_VERSION" | sed -E 's/-.*$//')"
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           case "$CHANNEL" in beta|stable) ;; *) echo "channel must be beta or stable" >&2; exit 1 ;; esac
           if [ "$CHANNEL" = stable ]; then
-            [[ "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "stable 需要 package.json 版本无后缀，当前: ${PKG_VERSION}" >&2; exit 1; }
-            VERSION="$PKG_VERSION"
+            [[ "${VERSION_INPUT:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "stable 需要输入 version（X.Y.Z），当前: '${VERSION_INPUT:-}'" >&2; exit 1; }
+            VERSION="$VERSION_INPUT"
           else
+          # base：最新正式版 tag 的下一个 patch；没有正式版时用 package.json 的 version（去掉后缀）
+          LATEST_STABLE="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+          if [ -n "$LATEST_STABLE" ]; then
+            IFS=. read -r MA MI PA <<< "$LATEST_STABLE"
+            BASE="${MA}.${MI}.$((PA + 1))"
+          else
+            BASE="$(node -p "require('./apps/desktop/package.json').version" | sed -E 's/-.*$//')"
+          fi
           if [ -n "${BETA_INPUT:-}" ]; then
             [[ "$BETA_INPUT" =~ ^[1-9][0-9]*$ ]] || { echo "beta must be a positive integer" >&2; exit 1; }
             N="$BETA_INPUT"
@@ -94,11 +108,11 @@ jobs:
           fi
           if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release v${VERSION} already exists" >&2
-            [ "$CHANNEL" = stable ] && echo "请先在源码仓库把 apps/desktop/package.json 的 version 提升到新版本再发 stable" >&2
             exit 1
           fi
           {
             echo "sha=$SHA"
+            echo "short_sha=$SHORT_SHA"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
           if [ "$CHANNEL" = beta ]; then
@@ -156,6 +170,11 @@ jobs:
         with:
           node-version: '22'
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: source/apps/core/go.mod
+          cache-dependency-path: source/apps/core/go.sum
+
       - name: Install dependencies
         working-directory: source
         run: pnpm install --frozen-lockfile
@@ -165,11 +184,15 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           CONFIG: ${{ steps.ver.outputs.config }}
+          SHORT_SHA: ${{ steps.ver.outputs.short_sha }}
           NODE_OPTIONS: --max-old-space-size=4096
         run: |
           set -euo pipefail
           pnpm run typecheck
           pnpm exec electron-vite build
+          # Go 核心：写入 core-bin/lattie-core，由 extraResources 打进 Contents/Resources/bin，electron-builder 一并签名
+          LATTIE_VERSION="${VERSION}" LATTIE_COMMIT="${SHORT_SHA}" GOOS=darwin GOARCH=arm64 node scripts/build-core.mjs
+          test "$(./core-bin/lattie-core --version | grep -c -- "${VERSION}")" -ge 1
           # beta 构建写入 publish.channel=beta：生成 beta-mac.yml，且 app-update.yml 带 channel: beta
           # stable 不设 channel：生成 latest-mac.yml
           EXTRA=()
@@ -210,6 +233,15 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "chk/${APP}"
           spctl -a -t exec -vv "chk/${APP}"
           /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "chk/${APP}/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "chk/${APP}/Contents/Info.plist")" = "${VERSION}"
+          # Go 核心：已签名（Developer ID + hardened runtime）且版本正确
+          CORE="chk/${APP}/Contents/Resources/bin/lattie-core"
+          codesign --verify --strict --verbose=2 "$CORE"
+          codesign -dv --verbose=2 "$CORE" 2>&1 | tee core-sign.txt
+          grep -q "Authority=Developer ID Application" core-sign.txt
+          grep -Eq "flags=.*runtime" core-sign.txt
+          "$CORE" --version
+          "$CORE" --version | grep -q -- "${VERSION}"
 
       - name: Publish release
         env:
