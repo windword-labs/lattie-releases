@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       SOURCE_REF: ${{ github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
